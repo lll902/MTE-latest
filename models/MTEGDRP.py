@@ -5,7 +5,7 @@ __Time__: 2024/8/21 14:30
 __File__: MTEGDRP.py
 __remark__:
 __Software__: PyCharm
-""" 
+"""
 import torch
 import torch.nn as nn
 from torch.nn import Linear
@@ -233,6 +233,7 @@ class OmicsTokenEmbedding(nn.Module):
     def __init__(self, num_features, model_dim, dropout=0.2):
         super().__init__()
         self.num_features = num_features
+        # nn.Linear(in_features, out_features)的in_features对应输入向量的最后一个特征维度
         self.value_projection = nn.Linear(1, model_dim)
         self.component_embedding = nn.Parameter(
             torch.zeros(1, num_features, model_dim)
@@ -252,6 +253,8 @@ class OmicsTokenEmbedding(nn.Module):
             )
 
         x = self.value_projection(x.unsqueeze(-1))
+        # x.unsqueeze(-1) shape [batch, num_features, 1]
+        # x shape: [batch, num_features, model_dim]
         x = x + self.component_embedding
         x = self.norm(x)
         return self.dropout(x)
@@ -270,6 +273,7 @@ class OmicsSelfAttentionBlock(nn.Module):
             batch_first=True
         )
         self.dropout1 = nn.Dropout(dropout)
+        #norm1和norm2能生成两套不同归一化缩放参数和偏移参数，所以不能复用
 
         self.norm2 = nn.LayerNorm(model_dim)
         self.ffn = nn.Sequential(
@@ -282,7 +286,7 @@ class OmicsSelfAttentionBlock(nn.Module):
 
     def forward(self, x):
         norm_x = self.norm1(x)
-        attn_out, _ = self.self_attn(
+        attn_out, attn_out_weights = self.self_attn(
             norm_x, norm_x, norm_x, need_weights=False
         )
         x = x + self.dropout1(attn_out)
@@ -308,7 +312,7 @@ class OmicsCrossAttention(nn.Module):
     def forward(self, query, source):
         query = self.query_norm(query)
         source = self.source_norm(source)
-        context, _ = self.cross_attn(
+        context, context_weights = self.cross_attn(
             query=query,
             key=source,
             value=source,
@@ -319,7 +323,6 @@ class OmicsCrossAttention(nn.Module):
 
 class GatedOmicsResidualFusion(nn.Module):
     """Inject methylation and mutation contexts into the mRNA main branch."""
-
     def __init__(self, model_dim, dropout=0.2):
         super().__init__()
         self.meth_gate = nn.Sequential(
@@ -372,7 +375,7 @@ class MTEGDRP(torch.nn.Module):
         self.fc_mat_egnn = Linear(num_features_xd * 2, num_features_xd)
         self.drug_layer1 = EGNN(dim=78)
         self.drug_layer2 = EGNN(dim=78)
-        self.drug_layer3 = EGNN(dim=156) 
+        self.drug_layer3 = EGNN(dim=156)
         self.fc_drug_jihe1 = Linear(78,390)
         self.fc_drug_jihe2 = Linear(390,156)
 
@@ -435,24 +438,19 @@ class MTEGDRP(torch.nn.Module):
             nn.LayerNorm(omics_model_dim),
             nn.Linear(omics_model_dim, connect_dim)
         )
-        self.meth_output_projection = nn.Sequential(
-            nn.LayerNorm(omics_model_dim),
-            nn.Linear(omics_model_dim, connect_dim)
-        )
-        self.mut_output_projection = nn.Sequential(
-            nn.LayerNorm(omics_model_dim),
-            nn.Linear(omics_model_dim, connect_dim)
-        )
+
+        # drug_data维度 = num_features_xd * 6，ge_data维度 = connect_dim。
+        fusion_input_dim = num_features_xd * 6 + connect_dim
 
         # Define the Transformer Decoder
         self.decoder = TransformerDecoder(
             num_layers=4,
-            d_model=852,  # Concatenated feature dimensions
+            d_model=fusion_input_dim,  # Concatenated feature dimensions
             nhead=4,  # Number of attention heads
             dropout=0.1
         )
 
-        self.fc1_all = Linear(852, 1024)
+        self.fc1_all = Linear(fusion_input_dim, 1024)
         self.fc2_all = Linear(1024, 512)
         self.fc3_all = Linear(512, 256)
         self.fc4_all = Linear(256, 128)
@@ -467,7 +465,7 @@ class MTEGDRP(torch.nn.Module):
         drug_poi_data, drug_edg_index, batch = data.x, data.edge_index, data.batch
         ge_data, meth_data, mut_data = data.target_ge, data.target_meth, data.target_mut
         coors = data.coordinates
-        
+
         drug_data = torch.unsqueeze(drug_poi_data, 1)
         mat_drug_data = self.mat(drug_data)
         drug_data = self.conv_gcn(mat_drug_data, drug_edg_index)
@@ -476,7 +474,7 @@ class MTEGDRP(torch.nn.Module):
         drug_data = self.bn1(drug_data)
         drug_data = self.conv_gcn(drug_data, drug_edg_index)
         drug_data = self.relu(drug_data)
-        
+
         egnn_list =[]
         index = 0
         for data_len in data.c_size:
@@ -489,13 +487,13 @@ class MTEGDRP(torch.nn.Module):
             temp_drug_data_jihe = temp_drug_data_jihe.squeeze(0)
             egnn_list.append(temp_drug_data_jihe)
             index+=data_len
-        
+
         egnn_features = torch.cat(egnn_list,dim=0)
 
         drug_data_final = torch.cat((drug_data,egnn_features),dim=1)
         drug_data_final = torch.cat([gmp(drug_data_final, batch), gap(drug_data_final, batch)], dim=1)
-    
-        
+
+
         drug_data = self.relu(self.fc1_drug(drug_data_final))
         drug_data = self.dropout(drug_data)
         drug_data = self.fc2_drug(drug_data)
@@ -533,10 +531,9 @@ class MTEGDRP(torch.nn.Module):
 
         # 对潜在特征token做均值池化，保持原有三个connect_dim向量接口不变
         ge_data = self.ge_output_projection(fused_ge_tokens.mean(dim=1))
-        meth_data = self.meth_output_projection(meth_tokens.mean(dim=1))
-        mut_data = self.mut_output_projection(mut_tokens.mean(dim=1))
+
         # -------------------------------------------------------------
-        concat_data = torch.cat((drug_data, ge_data, meth_data, mut_data), 1)
+        concat_data = torch.cat((drug_data, ge_data), 1)
         # Pass the concatenated features through the Transformer Decoder
         concat_data = concat_data.unsqueeze(0)  # Add batch dimension for Transformer input
         concat_data = self.decoder(concat_data, concat_data)
@@ -560,4 +557,4 @@ class MTEGDRP(torch.nn.Module):
         out = self.out(concat_data)
         #out = self.sigmoid(out)
         #out = nn.Sigmoid()(out)
-        return out, drug_data, mut_data
+        return out, drug_data, ge_data
