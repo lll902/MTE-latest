@@ -1,0 +1,25 @@
+# PyCharm 和 VS Code 配置
+.idea/
+.vscode/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 日志
+log/
+*.log
+
+# 环境变量和密钥
+.env
+*.key
+
+# 系统临时文件
+.DS_Store
+Thumbs.db
