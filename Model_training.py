@@ -1,4 +1,5 @@
 
+#三组学token嵌入→三组学分别自注意力 →甲基化、突变分别向mRNA交叉注意力 →门控残差融合→融合mRNA、甲基化、突变分别再自注意力->再交叉注意力融合三种组学->池化
 import numpy as np
 import pandas as pd
 import sys, os
@@ -170,10 +171,10 @@ def main(modeling, train_batch, val_batch, test_batch, lr, num_epoch, log_interv
             loss_fig_val_name = 'model_MTEGDRP_' + model_st + '_' + dataset + '_loss_val'
             pearson_fig_val_name = 'model_MTEGDRP_' + model_st + '_' + dataset + '_pearson_val'
 
-            model_dir = "/home/public_data/jlu/MTEGDRP-main/log/model/"
-            result_dir = "/home/public_data/jlu/MTEGDRP-main/log/result/"
-            evaluation_dir = "/home/public_data/jlu/MTEGDRP-main/log/evaluation/"
-            pred_dir = "/home/public_data/jlu/MTEGDRP-main/data/data_pred/"
+            model_dir = "/home/public_data/jlu/MTE/log/model/"
+            result_dir = "/home/public_data/jlu/MTE/log/result/"
+            evaluation_dir = "/home/public_data/jlu/MTE/log/evaluation/"
+            pred_dir = "/home/public_data/jlu/MTE/data/data_pred/"
             for path in [model_dir, result_dir, evaluation_dir, pred_dir]:
                 if not os.path.exists(path):
                     os.makedirs(path)

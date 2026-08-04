@@ -320,6 +320,20 @@ class OmicsCrossAttention(nn.Module):
         )
         return self.dropout(context)
 
+class OmicsAttentionPooling(nn.Module):
+    def __init__(self, model_dim):
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.Linear(model_dim, model_dim // 2),
+            nn.Tanh(),
+            nn.Linear(model_dim // 2, 1)
+        )
+
+    def forward(self, x):
+        # x: [batch, num_tokens, model_dim]
+        weights = torch.softmax(self.score(x), dim=1)
+        pooled = torch.sum(weights * x, dim=1)
+        return pooled
 
 class GatedOmicsResidualFusion(nn.Module):
     """Inject methylation and mutation contexts into the mRNA main branch."""
@@ -345,7 +359,17 @@ class GatedOmicsResidualFusion(nn.Module):
             + meth_gate * self.dropout(meth_context)
             + mut_gate * self.dropout(mut_context)
         )
-        return self.norm(fused)
+        fused = self.norm(fused)
+
+        gate_stats = {
+            "meth_mean": meth_gate.mean().detach(),
+            "meth_std": meth_gate.std().detach(),
+            "mut_mean": mut_gate.mean().detach(),
+            "mut_std": mut_gate.std().detach()
+        }
+
+        return fused, gate_stats
+
 
 
 class MTEGDRP(torch.nn.Module):
@@ -434,6 +458,9 @@ class MTEGDRP(torch.nn.Module):
         )
 
         # 池化后仍输出connect_dim维，保持后续药物-多组学拼接与解码器不变
+        self.ge_attention_pool = OmicsAttentionPooling(
+            omics_model_dim
+        )
         self.ge_output_projection = nn.Sequential(
             nn.LayerNorm(omics_model_dim),
             nn.Linear(omics_model_dim, connect_dim)
@@ -520,17 +547,26 @@ class MTEGDRP(torch.nn.Module):
         )
 
         # 3) 门控残差融合
-        fused_ge_tokens = self.omics_gated_fusion(
+        fused_ge_tokens, gate_stats = self.omics_gated_fusion(
             mrna=ge_tokens,
             meth_context=meth_context,
             mut_context=mut_context
         )
 
         # 4) 融合后的mRNA再做一次多头自注意力
-        fused_ge_tokens = self.ge_self_attention_2(fused_ge_tokens)
+        fused_ge_tokens = self.ge_self_attention_2(
+            fused_ge_tokens
+        )
 
-        # 对潜在特征token做均值池化，保持原有三个connect_dim向量接口不变
-        ge_data = self.ge_output_projection(fused_ge_tokens.mean(dim=1))
+        # 5) 对融合后的mRNA潜在token进行注意力池化
+        ge_summary = self.ge_attention_pool(
+            fused_ge_tokens
+        )
+
+        # 得到最终细胞系表示
+        ge_data = self.ge_output_projection(
+            ge_summary
+        )
 
         # -------------------------------------------------------------
         concat_data = torch.cat((drug_data, ge_data), 1)
