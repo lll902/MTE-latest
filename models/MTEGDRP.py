@@ -1,4 +1,7 @@
 """
+两阶段融合
+#三组学token嵌入→三组学分别自注意力 →甲基化、突变分别向mRNA交叉注意力 →门控残差融合→融合mRNA、甲基化、突变分别再自注意力->再交叉注意力融合三种组学->池化
+
 __coding__: utf-8
 __Author__: Liu Zhihan
 __Time__: 2024/8/21 14:30
@@ -14,19 +17,12 @@ from torch.nn import ReLU
 import torch.nn.functional as F
 from torch_geometric.nn import GINConv as GIN_layer
 from torch_geometric.nn import GCNConv as GCN_layer
-from torch_geometric.nn import (
-    GATConv as GAT_layer,
-    BatchNorm,
-    global_mean_pool,
-    global_max_pool,
-    global_add_pool
-)
+from torch_geometric.nn import GATConv as GAT_layer, BatchNorm, global_mean_pool, global_max_pool, global_add_pool
 from torch_geometric.nn import global_mean_pool as gap
 from torch_geometric.nn import global_max_pool as gmp
 from torch import nn, einsum
 from einops import rearrange
 from models.egnn_pytorch import EGNN
-
 
 DIST_KERNELS = {
     'exp': {
@@ -83,16 +79,7 @@ class FeedForward(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(
-            self,
-            dim=78,
-            heads=6,
-            dim_head=13,
-            Lg=0.5,
-            Ld=0.5,
-            La=1,
-            dist_kernel_fn='exp'
-    ):
+    def __init__(self, dim=78, heads=6, dim_head=13, Lg=0.5, Ld=0.5, La=1, dist_kernel_fn='exp'):
         super().__init__()
         inner_dim = dim_head * heads
         self.heads = heads
@@ -106,46 +93,18 @@ class Attention(nn.Module):
 
         self.dist_kernel_fn = dist_kernel_fn
 
-    def forward(
-            self,
-            x,
-            mask=None,
-            adjacency_mat=None,
-            distance_mat=None
-    ):
-        h, La, Ld, Lg, dist_kernel_fn = (
-            self.heads,
-            self.La,
-            self.Ld,
-            self.Lg,
-            self.dist_kernel_fn
-        )
+    def forward(self, x, mask=None, adjacency_mat=None, distance_mat=None):
+        h, La, Ld, Lg, dist_kernel_fn = self.heads, self.La, self.Ld, self.Lg, self.dist_kernel_fn
 
         qkv = self.to_qkv(x)
-        q, k, v = rearrange(
-            qkv,
-            'b n (h qkv d) -> b h n qkv d',
-            h=h,
-            qkv=3
-        ).unbind(dim=-2)
-
-        dots = einsum(
-            'b h i d, b h j d -> b h i j',
-            q,
-            k
-        ) * self.scale
+        q, k, v = rearrange(qkv, 'b n (h qkv d) -> b h n qkv d', h=h, qkv=3).unbind(dim=-2)
+        dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
 
         if exists(distance_mat):
-            distance_mat = rearrange(
-                distance_mat,
-                'b i j -> b () i j'
-            )
+            distance_mat = rearrange(distance_mat, 'b i j -> b () i j')
 
         if exists(adjacency_mat):
-            adjacency_mat = rearrange(
-                adjacency_mat,
-                'b i j -> b () i j'
-            )
+            adjacency_mat = rearrange(adjacency_mat, 'b i j -> b () i j')
 
         if exists(mask):
             mask_value = torch.finfo(dots.dtype).max
@@ -165,17 +124,8 @@ class Attention(nn.Module):
         if exists(adjacency_mat):
             attn = attn + Lg * adjacency_mat
 
-        out = einsum(
-            'b h i j, b h j d -> b h i d',
-            attn,
-            v
-        )
-
-        out = rearrange(
-            out,
-            'b h n d -> b n (h d)'
-        )
-
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
 
 
@@ -200,27 +150,10 @@ class MAT(nn.Module):
 
         for _ in range(depth):
             layer = nn.ModuleList([
-                Residual(
-                    PreNorm(
-                        model_dim,
-                        Attention(
-                            model_dim,
-                            heads=heads,
-                            Lg=Lg,
-                            Ld=Ld,
-                            La=La,
-                            dist_kernel_fn=dist_kernel_fn
-                        )
-                    )
-                ),
-                Residual(
-                    PreNorm(
-                        model_dim,
-                        FeedForward(model_dim)
-                    )
-                )
+                Residual(PreNorm(model_dim, Attention(model_dim, heads=heads, Lg=Lg, Ld=Ld, La=La,
+                                                      dist_kernel_fn=dist_kernel_fn))),
+                Residual(PreNorm(model_dim, FeedForward(model_dim)))
             ])
-
             self.layers.append(layer)
 
         self.norm_out = nn.LayerNorm(model_dim)
@@ -235,7 +168,7 @@ class MAT(nn.Module):
     ):
         x = self.embed_to_model(x)
 
-        for attn, ff in self.layers:
+        for (attn, ff) in self.layers:
             x = attn(
                 x,
                 mask=mask,
@@ -247,7 +180,6 @@ class MAT(nn.Module):
         x = self.norm_out(x)
         x = x.mean(dim=-2)
         x = self.ff_out(x)
-
         return x
 
 
@@ -255,91 +187,45 @@ class MAT(nn.Module):
 class TransformerDecoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dropout=0.1):
         super(TransformerDecoderLayer, self).__init__()
-
-        self.self_attn = nn.MultiheadAttention(
-            d_model,
-            nhead,
-            dropout=dropout
-        )
-
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
-
         self.linear1 = nn.Linear(d_model, 2048)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(2048, d_model)
-
         self.activation = nn.ReLU()
 
     def forward(self, tgt, memory):
-        tgt2 = self.self_attn(
-            tgt,
-            memory,
-            memory
-        )[0]
-
+        tgt2 = self.self_attn(tgt, memory, memory)[0]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
-
-        tgt2 = self.linear2(
-            self.dropout(
-                self.activation(
-                    self.linear1(tgt)
-                )
-            )
-        )
-
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
-
         return tgt
 
 
 # Define the Transformer Decoder
 class TransformerDecoder(nn.Module):
-    def __init__(
-            self,
-            num_layers,
-            d_model,
-            nhead,
-            dropout=0.1
-    ):
+    def __init__(self, num_layers, d_model, nhead, dropout=0.1):
         super(TransformerDecoder, self).__init__()
-
         self.layers = nn.ModuleList([
-            TransformerDecoderLayer(
-                d_model,
-                nhead,
-                dropout
-            )
-            for _ in range(num_layers)
+            TransformerDecoderLayer(d_model, nhead, dropout) for _ in range(num_layers)
         ])
-
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, tgt, memory):
         for layer in self.layers:
             tgt = layer(tgt, memory)
-
         return self.norm(tgt)
 
 
 class MTEGDRP(torch.nn.Module):
-    def __init__(
-            self,
-            output_dim=1,
-            num_features_xd=78,
-            ge_features_dim=128,
-            num_features_xt=25,
-            embed_dim=128,
-            mut_feature_dim=128,
-            meth_feature_dim=128,
-            connect_dim=128,
-            dropout=0.2
-    ):
+    def __init__(self, output_dim=1, num_features_xd=78,
+                 ge_features_dim=128, num_features_xt=25, embed_dim=128,
+                 mut_feature_dim=128, meth_feature_dim=128, connect_dim=128, dropout=0.2):
         super(MTEGDRP, self).__init__()
 
         self.mat = MAT(
@@ -351,68 +237,34 @@ class MTEGDRP(torch.nn.Module):
             Lg=0.5,
             Ld=0.5,
             La=1,
-            dist_kernel_fn='exp'
-        )
+            dist_kernel_fn='exp')
+        self.conv_gcn = GCN_layer(num_features_xd * 2, num_features_xd * 2)
 
-        self.conv_gcn = GCN_layer(
-            num_features_xd * 2,
-            num_features_xd * 2
-        )
-
-        net1 = Sequential(
-            Linear(
-                num_features_xd * 2,
-                num_features_xd * 2
-            ),
-            ReLU(),
-            Linear(
-                num_features_xd * 2,
-                num_features_xd * 2
-            )
-        )
-
+        net1 = Sequential(Linear(num_features_xd * 2, num_features_xd * 2), ReLU(),
+                          Linear(num_features_xd * 2, num_features_xd * 2))
         self.conv_gin1 = GIN_layer(net1)
-        self.bn1 = torch.nn.BatchNorm1d(
-            num_features_xd * 2
-        )
+        self.bn1 = torch.nn.BatchNorm1d(num_features_xd * 2)
 
-        self.fc_mat_egnn = Linear(
-            num_features_xd * 2,
-            num_features_xd
-        )
-
+        self.fc_mat_egnn = Linear(num_features_xd * 2, num_features_xd)
         self.drug_layer1 = EGNN(dim=78)
         self.drug_layer2 = EGNN(dim=78)
         self.drug_layer3 = EGNN(dim=156)
-
         self.fc_drug_jihe1 = Linear(78, 390)
         self.fc_drug_jihe2 = Linear(390, 156)
 
         self.fc3_drug = Linear(312, 156)
 
-        self.fc1_drug = Linear(
-            num_features_xd * 6,
-            num_features_xd * 12
-        )
-
-        self.fc2_drug = Linear(
-            num_features_xd * 12,
-            num_features_xd * 6
-        )
+        self.fc1_drug = Linear(num_features_xd * 6, num_features_xd * 12)
+        self.fc2_drug = Linear(num_features_xd * 12, num_features_xd * 6)
 
         # 多组学Transformer参数：每个KPCA分量作为一个token
-        # 输入[batch, 128]先变为[batch, 128, 1]，
-        # 再投影为[batch, 128, 32]
+        # 输入[batch, 128]先变为[batch, 128, 1]，再投影为[batch, 128, 32]
         omics_model_dim = 32
         omics_nhead = 4
         omics_ff_dim = 128
 
         # 单组组学数据特征--GE
-        self.ge_value_projection = Linear(
-            1,
-            omics_model_dim
-        )
-
+        self.ge_value_projection = Linear(1, omics_model_dim)
         self.EncoderLayer_ge_1 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
@@ -421,12 +273,7 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-
-        self.conv_ge_1 = nn.TransformerEncoder(
-            self.EncoderLayer_ge_1,
-            1
-        )
-
+        self.conv_ge_1 = nn.TransformerEncoder(self.EncoderLayer_ge_1, 1)
         self.EncoderLayer_ge_2 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
@@ -435,12 +282,7 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-
-        self.conv_ge_2 = nn.TransformerEncoder(
-            self.EncoderLayer_ge_2,
-            1
-        )
-
+        self.conv_ge_2 = nn.TransformerEncoder(self.EncoderLayer_ge_2, 1)
         self.EncoderLayer_ge_3 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
@@ -449,18 +291,10 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-
-        self.conv_ge_3 = nn.TransformerEncoder(
-            self.EncoderLayer_ge_3,
-            1
-        )
+        self.conv_ge_3 = nn.TransformerEncoder(self.EncoderLayer_ge_3, 1)
 
         # 单组组学数据特征--MUT
-        self.mut_value_projection = Linear(
-            1,
-            omics_model_dim
-        )
-
+        self.mut_value_projection = Linear(1, omics_model_dim)
         self.EncoderLayer_mut_1 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
@@ -469,12 +303,7 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-
-        self.conv_mut_1 = nn.TransformerEncoder(
-            self.EncoderLayer_mut_1,
-            1
-        )
-
+        self.conv_mut_1 = nn.TransformerEncoder(self.EncoderLayer_mut_1, 1)
         self.EncoderLayer_mut_2 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
@@ -483,12 +312,7 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-
-        self.conv_mut_2 = nn.TransformerEncoder(
-            self.EncoderLayer_mut_2,
-            1
-        )
-
+        self.conv_mut_2 = nn.TransformerEncoder(self.EncoderLayer_mut_2, 1)
         self.EncoderLayer_mut_3 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
@@ -497,18 +321,10 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-
-        self.conv_mut_3 = nn.TransformerEncoder(
-            self.EncoderLayer_mut_3,
-            1
-        )
+        self.conv_mut_3 = nn.TransformerEncoder(self.EncoderLayer_mut_3, 1)
 
         # 单组组学数据特征--METH
-        self.meth_value_projection = Linear(
-            1,
-            omics_model_dim
-        )
-
+        self.meth_value_projection = Linear(1, omics_model_dim)
         self.EncoderLayer_meth_1 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
@@ -517,12 +333,7 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-
-        self.conv_meth_1 = nn.TransformerEncoder(
-            self.EncoderLayer_meth_1,
-            1
-        )
-
+        self.conv_meth_1 = nn.TransformerEncoder(self.EncoderLayer_meth_1, 1)
         self.EncoderLayer_meth_2 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
@@ -531,12 +342,7 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-
-        self.conv_meth_2 = nn.TransformerEncoder(
-            self.EncoderLayer_meth_2,
-            1
-        )
-
+        self.conv_meth_2 = nn.TransformerEncoder(self.EncoderLayer_meth_2, 1)
         self.EncoderLayer_meth_3 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
@@ -545,11 +351,7 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-
-        self.conv_meth_3 = nn.TransformerEncoder(
-            self.EncoderLayer_meth_3,
-            1
-        )
+        self.conv_meth_3 = nn.TransformerEncoder(self.EncoderLayer_meth_3, 1)
 
         # 甲基化和突变分别通过交叉注意力融入mRNA
         # 三种组学的输入、输出形状均为[batch, 128, 32]
@@ -559,7 +361,6 @@ class MTEGDRP(torch.nn.Module):
             dropout=dropout,
             batch_first=True
         )
-
         self.mut_to_ge_cross_attention = nn.MultiheadAttention(
             embed_dim=omics_model_dim,
             num_heads=omics_nhead,
@@ -569,22 +370,15 @@ class MTEGDRP(torch.nn.Module):
 
         # 门控：分别控制甲基化和突变信息融入mRNA的比例
         self.meth_gate = nn.Sequential(
-            Linear(
-                omics_model_dim * 2,
-                omics_model_dim
-            ),
+            Linear(omics_model_dim * 2, omics_model_dim),
             nn.Sigmoid()
         )
-
         self.mut_gate = nn.Sequential(
-            Linear(
-                omics_model_dim * 2,
-                omics_model_dim
-            ),
+            Linear(omics_model_dim * 2, omics_model_dim),
             nn.Sigmoid()
         )
 
-        # 融合后的mRNA再经过一层Transformer
+        # 第一次门控融合后，mRNA、甲基化和突变分别再经过一层Transformer
         self.EncoderLayer_ge_fusion = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
@@ -593,47 +387,69 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-
         self.conv_ge_fusion = nn.TransformerEncoder(
             self.EncoderLayer_ge_fusion,
             1
         )
 
-        # 融合后的mRNA平均池化后映射为128维
-        self.ge_output_projection = Linear(
-            omics_model_dim,
-            connect_dim
+        self.EncoderLayer_meth_refine = nn.TransformerEncoderLayer(
+            d_model=omics_model_dim,
+            nhead=omics_nhead,
+            dim_feedforward=omics_ff_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True
+        )
+        self.conv_meth_refine = nn.TransformerEncoder(
+            self.EncoderLayer_meth_refine,
+            1
         )
 
-        # 三层Transformer后的甲基化表示映射为64维
-        self.meth_concat_projection = Linear(
-            omics_model_dim,
-            64
+        self.EncoderLayer_mut_refine = nn.TransformerEncoderLayer(
+            d_model=omics_model_dim,
+            nhead=omics_nhead,
+            dim_feedforward=omics_ff_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True
+        )
+        self.conv_mut_refine = nn.TransformerEncoder(
+            self.EncoderLayer_mut_refine,
+            1
         )
 
-        # 三层Transformer后的突变表示映射为64维
-        self.mut_concat_projection = Linear(
-            omics_model_dim,
-            64
+        # 第二次交叉注意力使用独立参数
+        self.meth_to_ge_cross_attention_2 = nn.MultiheadAttention(
+            embed_dim=omics_model_dim,
+            num_heads=omics_nhead,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.mut_to_ge_cross_attention_2 = nn.MultiheadAttention(
+            embed_dim=omics_model_dim,
+            num_heads=omics_nhead,
+            dropout=dropout,
+            batch_first=True
         )
 
-        # 保留原来的128维突变特征作为模型第三个返回值
-        self.mut_output_projection = Linear(
-            omics_model_dim,
-            connect_dim
+        # 第二次门控融合使用独立参数
+        self.meth_gate_2 = nn.Sequential(
+            Linear(omics_model_dim * 2, omics_model_dim),
+            nn.Sigmoid()
+        )
+        self.mut_gate_2 = nn.Sequential(
+            Linear(omics_model_dim * 2, omics_model_dim),
+            nn.Sigmoid()
         )
 
-        # 药物468维 + 融合mRNA 128维
-        # + 甲基化64维 + 突变64维 = 724维
-        fusion_input_dim = (
-            num_features_xd * 6
-            + connect_dim
-            + 64
-            + 64
-        )
+        # 平均池化后映射回128维，保持与后续药物拼接维度一致
+        self.ge_output_projection = Linear(omics_model_dim, connect_dim)
+        self.mut_output_projection = Linear(omics_model_dim, connect_dim)
 
-        # 保留原来的Transformer Decoder，
-        # 仅同步修改拼接后的输入维度
+        # 药物特征维度为num_features_xd * 6，融合后的mRNA维度为connect_dim
+        fusion_input_dim = num_features_xd * 6 + connect_dim
+
+        # 保留原来的Transformer Decoder，仅同步修改拼接后的输入维度
         self.decoder = TransformerDecoder(
             num_layers=4,
             d_model=fusion_input_dim,
@@ -641,30 +457,11 @@ class MTEGDRP(torch.nn.Module):
             dropout=0.1
         )
 
-        self.fc1_all = Linear(
-            fusion_input_dim,
-            1024
-        )
-
-        self.fc2_all = Linear(
-            1024,
-            512
-        )
-
-        self.fc3_all = Linear(
-            512,
-            256
-        )
-
-        self.fc4_all = Linear(
-            256,
-            128
-        )
-
-        self.out = Linear(
-            connect_dim,
-            output_dim
-        )
+        self.fc1_all = Linear(fusion_input_dim, 1024)
+        self.fc2_all = Linear(1024, 512)
+        self.fc3_all = Linear(512, 256)
+        self.fc4_all = Linear(256, 128)
+        self.out = Linear(connect_dim, output_dim)
 
         # 激活函数和正则化
         self.relu = ReLU()
@@ -672,342 +469,150 @@ class MTEGDRP(torch.nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, data):
-        drug_poi_data = data.x
-        drug_edg_index = data.edge_index
-        batch = data.batch
-
-        ge_data = data.target_ge
-        meth_data = data.target_meth
-        mut_data = data.target_mut
-
+        drug_poi_data, drug_edg_index, batch = data.x, data.edge_index, data.batch
+        ge_data, meth_data, mut_data = data.target_ge, data.target_meth, data.target_mut
         coors = data.coordinates
 
-        drug_data = torch.unsqueeze(
-            drug_poi_data,
-            1
-        )
-
+        drug_data = torch.unsqueeze(drug_poi_data, 1)
         mat_drug_data = self.mat(drug_data)
-
-        drug_data = self.conv_gcn(
-            mat_drug_data,
-            drug_edg_index
-        )
-
+        drug_data = self.conv_gcn(mat_drug_data, drug_edg_index)
         drug_data = self.relu(drug_data)
-
-        drug_data = F.relu(
-            self.conv_gin1(
-                drug_data,
-                drug_edg_index
-            )
-        )
-
+        drug_data = F.relu(self.conv_gin1(drug_data, drug_edg_index))
         drug_data = self.bn1(drug_data)
-
-        drug_data = self.conv_gcn(
-            drug_data,
-            drug_edg_index
-        )
-
+        drug_data = self.conv_gcn(drug_data, drug_edg_index)
         drug_data = self.relu(drug_data)
 
         egnn_list = []
         index = 0
-
         for data_len in data.c_size:
             data_len = int(data_len.item())
-
-            temp_data = mat_drug_data[
-                index:index + data_len
-            ]
-
-            temp_data = self.fc_mat_egnn(
-                temp_data
-            ).unsqueeze(0)
-
-            temp_coors = coors[
-                index:index + data_len
-            ].unsqueeze(0)
-
-            temp_drug_data_jihe, temp_ehnncoors = (
-                self.drug_layer1(
-                    temp_data,
-                    temp_coors
-                )
-            )
-
-            temp_drug_data_jihe, temp_ehnncoors = (
-                self.drug_layer2(
-                    temp_drug_data_jihe,
-                    temp_ehnncoors
-                )
-            )
-
-            temp_drug_data_jihe = (
-                temp_drug_data_jihe.squeeze(0)
-            )
-
-            egnn_list.append(
-                temp_drug_data_jihe
-            )
-
+            temp_data = mat_drug_data[index:index + data_len]
+            temp_data = self.fc_mat_egnn(temp_data).unsqueeze(0)
+            temp_coors = coors[index:index + data_len].unsqueeze(0)
+            temp_drug_data_jihe, temp_ehnncoors = self.drug_layer1(temp_data, temp_coors)
+            temp_drug_data_jihe, temp_ehnncoors = self.drug_layer2(temp_drug_data_jihe, temp_ehnncoors)
+            temp_drug_data_jihe = temp_drug_data_jihe.squeeze(0)
+            egnn_list.append(temp_drug_data_jihe)
             index += data_len
 
-        egnn_features = torch.cat(
-            egnn_list,
-            dim=0
+        egnn_features = torch.cat(egnn_list, dim=0)
+
+        drug_data_final = torch.cat((drug_data, egnn_features), dim=1)
+        drug_data_final = torch.cat([gmp(drug_data_final, batch), gap(drug_data_final, batch)], dim=1)
+
+        drug_data = self.relu(self.fc1_drug(drug_data_final))
+        drug_data = self.dropout(drug_data)
+        drug_data = self.fc2_drug(drug_data)
+
+        # mRNA：[batch, 128] -> [batch, 128, 1] -> [batch, 128, 32]
+        ge_data = self.ge_value_projection(ge_data.unsqueeze(-1))
+        ge_data = self.conv_ge_1(ge_data)
+        ge_data = self.conv_ge_2(ge_data)
+        ge_data = self.conv_ge_3(ge_data)
+
+        # 突变：[batch, 128] -> [batch, 128, 1] -> [batch, 128, 32]
+        mut_data = self.mut_value_projection(mut_data.unsqueeze(-1))
+        mut_data = self.conv_mut_1(mut_data)
+        mut_data = self.conv_mut_2(mut_data)
+        mut_data = self.conv_mut_3(mut_data)
+
+        # 甲基化：[batch, 128] -> [batch, 128, 1] -> [batch, 128, 32]
+        meth_data = self.meth_value_projection(meth_data.unsqueeze(-1))
+        meth_data = self.conv_meth_1(meth_data)
+        meth_data = self.conv_meth_2(meth_data)
+        meth_data = self.conv_meth_3(meth_data)
+
+        # 第一次交叉注意力：甲基化和突变分别以mRNA为Query
+        meth_context_1, _ = self.meth_to_ge_cross_attention(
+            query=ge_data,
+            key=meth_data,
+            value=meth_data,
+            need_weights=False
+        )
+        mut_context_1, _ = self.mut_to_ge_cross_attention(
+            query=ge_data,
+            key=mut_data,
+            value=mut_data,
+            need_weights=False
         )
 
-        drug_data_final = torch.cat(
-            (
-                drug_data,
-                egnn_features
-            ),
-            dim=1
+        # 第一次门控融合
+        meth_gate_1 = self.meth_gate(
+            torch.cat((ge_data, meth_context_1), dim=-1)
+        )
+        mut_gate_1 = self.mut_gate(
+            torch.cat((ge_data, mut_context_1), dim=-1)
+        )
+        ge_data = (
+                ge_data
+                + meth_gate_1 * meth_context_1
+                + mut_gate_1 * mut_context_1
         )
 
-        drug_data_final = torch.cat(
-            [
-                gmp(
-                    drug_data_final,
-                    batch
-                ),
-                gap(
-                    drug_data_final,
-                    batch
-                )
-            ],
-            dim=1
-        )
-
-        drug_data = self.relu(
-            self.fc1_drug(
-                drug_data_final
-            )
-        )
-
-        drug_data = self.dropout(
-            drug_data
-        )
-
-        drug_data = self.fc2_drug(
-            drug_data
-        )
-
-        # mRNA：
-        # [batch, 128] -> [batch, 128, 1]
-        # -> [batch, 128, 32]
-        ge_data = self.ge_value_projection(
-            ge_data.unsqueeze(-1)
-        )
-
-        ge_data = self.conv_ge_1(
-            ge_data
-        )
-
-        ge_data = self.conv_ge_2(
-            ge_data
-        )
-
-        ge_data = self.conv_ge_3(
-            ge_data
-        )
-
-        # 突变：
-        # [batch, 128] -> [batch, 128, 1]
-        # -> [batch, 128, 32]
-        mut_data = self.mut_value_projection(
-            mut_data.unsqueeze(-1)
-        )
-
-        mut_data = self.conv_mut_1(
-            mut_data
-        )
-
-        mut_data = self.conv_mut_2(
-            mut_data
-        )
-
-        mut_data = self.conv_mut_3(
-            mut_data
-        )
+        # 第一次融合后，三种组学分别再经过一层Transformer
+        ge_data = self.conv_ge_fusion(ge_data)
+        meth_data = self.conv_meth_refine(meth_data)
+        mut_data = self.conv_mut_refine(mut_data)
 
         # 保留128维突变特征作为模型第三个返回值
         mut_output = self.mut_output_projection(
             mut_data.mean(dim=1)
         )
 
-        # 三层Transformer后的突变表示映射为64维，
-        # 用于最终拼接
-        mut_concat_output = (
-            self.mut_concat_projection(
-                mut_data.mean(dim=1)
-            )
+        # 第二次交叉注意力：使用独立参数
+        meth_context_2, _ = self.meth_to_ge_cross_attention_2(
+            query=ge_data,
+            key=meth_data,
+            value=meth_data,
+            need_weights=False
+        )
+        mut_context_2, _ = self.mut_to_ge_cross_attention_2(
+            query=ge_data,
+            key=mut_data,
+            value=mut_data,
+            need_weights=False
         )
 
-        # 甲基化：
-        # [batch, 128] -> [batch, 128, 1]
-        # -> [batch, 128, 32]
-        meth_data = self.meth_value_projection(
-            meth_data.unsqueeze(-1)
+        # 第二次门控融合：使用独立参数
+        meth_gate_2 = self.meth_gate_2(
+            torch.cat((ge_data, meth_context_2), dim=-1)
         )
-
-        meth_data = self.conv_meth_1(
-            meth_data
+        mut_gate_2 = self.mut_gate_2(
+            torch.cat((ge_data, mut_context_2), dim=-1)
         )
-
-        meth_data = self.conv_meth_2(
-            meth_data
-        )
-
-        meth_data = self.conv_meth_3(
-            meth_data
-        )
-
-        # 三层Transformer后的甲基化表示映射为64维，
-        # 用于最终拼接
-        meth_output = self.meth_concat_projection(
-            meth_data.mean(dim=1)
-        )
-
-        # 甲基化和突变分别以mRNA为Query进行交叉注意力
-        meth_context, _ = (
-            self.meth_to_ge_cross_attention(
-                query=ge_data,
-                key=meth_data,
-                value=meth_data,
-                need_weights=False
-            )
-        )
-
-        mut_context, _ = (
-            self.mut_to_ge_cross_attention(
-                query=ge_data,
-                key=mut_data,
-                value=mut_data,
-                need_weights=False
-            )
-        )
-
-        # 门控融合：保留mRNA主分支，
-        # 并控制两种辅助组学的注入强度
-        meth_gate = self.meth_gate(
-            torch.cat(
-                (
-                    ge_data,
-                    meth_context
-                ),
-                dim=-1
-            )
-        )
-
-        mut_gate = self.mut_gate(
-            torch.cat(
-                (
-                    ge_data,
-                    mut_context
-                ),
-                dim=-1
-            )
-        )
-
         ge_data = (
-            ge_data
-            + meth_gate * meth_context
-            + mut_gate * mut_context
+                ge_data
+                + meth_gate_2 * meth_context_2
+                + mut_gate_2 * mut_context_2
         )
 
-        # 融合后的mRNA再经过Transformer
-        ge_data = self.conv_ge_fusion(
-            ge_data
-        )
-
-        # 对128个token做平均池化，
-        # 再映射为[batch, 128]
+        # 对128个token做平均池化，再映射为[batch, 128]
         ge_data = self.ge_output_projection(
             ge_data.mean(dim=1)
         )
 
-        # 最终拼接：
-        # 药物468维
-        # + 融合mRNA 128维
-        # + 甲基化64维
-        # + 突变64维
-        # = 724维
-        concat_data = torch.cat(
-            (
-                drug_data,
-                ge_data,
-                meth_output,
-                mut_concat_output
-            ),
-            dim=1
-        )
+        # 只将药物特征和融合后的mRNA特征拼接
+        concat_data = torch.cat((drug_data, ge_data), 1)
 
         # 保留原来的Transformer Decoder及其调用方式
         concat_data = concat_data.unsqueeze(0)
-
-        concat_data = self.decoder(
-            concat_data,
-            concat_data
-        )
-
+        concat_data = self.decoder(concat_data, concat_data)
         concat_data = concat_data.squeeze(0)
 
         # 隐藏层
-        concat_data = self.fc1_all(
-            concat_data
-        )
-
-        concat_data = self.relu(
-            concat_data
-        )
-
-        concat_data = self.dropout(
-            concat_data
-        )
-
-        concat_data = self.fc2_all(
-            concat_data
-        )
-
-        concat_data = self.relu(
-            concat_data
-        )
-
-        concat_data = self.dropout(
-            concat_data
-        )
-
-        concat_data = self.fc3_all(
-            concat_data
-        )
-
-        concat_data = self.relu(
-            concat_data
-        )
-
-        concat_data = self.dropout(
-            concat_data
-        )
-
-        concat_data = self.fc4_all(
-            concat_data
-        )
-
-        concat_data = self.relu(
-            concat_data
-        )
-
-        concat_data = self.dropout(
-            concat_data
-        )
-
-        out = self.out(
-            concat_data
-        )
-
+        concat_data = self.fc1_all(concat_data)
+        concat_data = self.relu(concat_data)
+        concat_data = self.dropout(concat_data)
+        concat_data = self.fc2_all(concat_data)
+        concat_data = self.relu(concat_data)
+        concat_data = self.dropout(concat_data)
+        concat_data = self.fc3_all(concat_data)
+        concat_data = self.relu(concat_data)
+        concat_data = self.dropout(concat_data)
+        concat_data = self.fc4_all(concat_data)
+        concat_data = self.relu(concat_data)
+        concat_data = self.dropout(concat_data)
+        out = self.out(concat_data)
         # out = self.sigmoid(out)
         # out = nn.Sigmoid()(out)
         return out, drug_data, mut_output
