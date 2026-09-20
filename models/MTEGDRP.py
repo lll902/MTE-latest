@@ -1,6 +1,11 @@
 """
-两阶段融合
-#三组学token嵌入→三组学分别自注意力 →甲基化、突变分别向mRNA交叉注意力 →门控残差融合→融合mRNA、甲基化、突变分别再自注意力->再交叉注意力融合三种组学->池化
+四层渐进式双向Co-Attention融合
+# 三组学token嵌入→三组学分别经过1层Transformer→
+# 第1层CA：突变↔甲基化→Fusion_1→
+# 第2层CA：Fusion_1↔甲基化→Fusion_2→
+# 第3层CA：Fusion_2↔mRNA→Fusion_3→
+# 第4层CA：Fusion_3↔mRNA→Fusion_4→平均池化→128维多组学融合特征
+# 4层CA参数互不共享；每个方向均使用Residual + LayerNorm + FFN + Residual + LayerNorm，层输出再做LayerNorm
 
 __coding__: utf-8
 __Author__: Liu Zhihan
@@ -222,11 +227,113 @@ class TransformerDecoder(nn.Module):
         return self.norm(tgt)
 
 
+# 单个方向的Co-Attention Block：
+# Query来自一个模态，Key/Value来自另一个模态
+# Cross-Attention -> Residual + LayerNorm -> FFN -> Residual + LayerNorm
+class CoAttentionBlock(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
+        super(CoAttentionBlock, self).__init__()
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.ff_dropout = nn.Dropout(dropout)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.activation = nn.GELU()
+
+    def forward(self, query_data, context_data):
+        # Query来自query_data，Key和Value来自context_data
+        attn_output, _ = self.cross_attn(
+            query=query_data,
+            key=context_data,
+            value=context_data,
+            need_weights=False
+        )
+        # Cross-Attention后的残差连接和LayerNorm
+        output = self.norm1(
+            query_data + self.dropout1(attn_output)
+        )
+
+        # FFN
+        ffn_output = self.linear2(
+            self.ff_dropout(
+                self.activation(
+                    self.linear1(output)
+                )
+            )
+        )
+        # FFN后的残差连接和LayerNorm
+        output = self.norm2(
+            output + self.dropout2(ffn_output)
+        )
+
+        return output
+
+
+# 一层双向Co-Attention Layer：
+# A <- B 和 B <- A 两个方向分别计算，再拼接并映射回32维
+class CoAttentionLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
+        super(CoAttentionLayer, self).__init__()
+
+        # 两个方向使用独立参数
+        self.a_from_b = CoAttentionBlock(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout
+        )
+
+        self.b_from_a = CoAttentionBlock(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout
+        )
+        # 两个方向的输出：[batch, 128, 32] + [batch, 128, 32]
+        # 拼接为[batch, 128, 64]，再映射回[batch, 128, 32]
+        self.fusion_projection = nn.Linear(d_model * 2, d_model)
+        # 每层双向融合完成后再做一次LayerNorm，稳定层间传递
+        self.fusion_norm = nn.LayerNorm(d_model)
+    def forward(self, data_a, data_b):
+        # A <- B
+        a_conditioned_on_b = self.a_from_b(
+            query_data=data_a,
+            context_data=data_b
+        )
+        # B <- A
+        b_conditioned_on_a = self.b_from_a(
+            query_data=data_b,
+            context_data=data_a
+        )
+        # 双向结果拼接后形成当前CA层的融合表示
+        fusion_data = torch.cat(
+            (a_conditioned_on_b, b_conditioned_on_a),
+            dim=-1
+        )
+        fusion_data = self.fusion_projection(fusion_data)
+        # 当前CA层双向融合后的LayerNorm
+        fusion_data = self.fusion_norm(fusion_data)
+
+        return fusion_data
+
+
 class MTEGDRP(torch.nn.Module):
     def __init__(self, output_dim=1, num_features_xd=78,
                  ge_features_dim=128, num_features_xt=25, embed_dim=128,
                  mut_feature_dim=128, meth_feature_dim=128, connect_dim=128, dropout=0.2):
-        super(MTEGDRP, self).__init__()
+        super().__init__()
 
         self.mat = MAT(
             dim_in=78,
@@ -245,7 +352,6 @@ class MTEGDRP(torch.nn.Module):
         self.conv_gin1 = GIN_layer(net1)
         self.bn1 = torch.nn.BatchNorm1d(num_features_xd * 2)
 
-        self.fc_mat_egnn = Linear(num_features_xd * 2, num_features_xd)
         self.drug_layer1 = EGNN(dim=78)
         self.drug_layer2 = EGNN(dim=78)
         self.drug_layer3 = EGNN(dim=156)
@@ -263,7 +369,7 @@ class MTEGDRP(torch.nn.Module):
         omics_nhead = 4
         omics_ff_dim = 128
 
-        # 单组组学数据特征--GE
+        # mRNA：只使用1层Transformer提取单组学内部特征
         self.ge_value_projection = Linear(1, omics_model_dim)
         self.EncoderLayer_ge_1 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
@@ -273,27 +379,12 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-        self.conv_ge_1 = nn.TransformerEncoder(self.EncoderLayer_ge_1, 1)
-        self.EncoderLayer_ge_2 = nn.TransformerEncoderLayer(
-            d_model=omics_model_dim,
-            nhead=omics_nhead,
-            dim_feedforward=omics_ff_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True
+        self.conv_ge_1 = nn.TransformerEncoder(
+            self.EncoderLayer_ge_1,
+            1
         )
-        self.conv_ge_2 = nn.TransformerEncoder(self.EncoderLayer_ge_2, 1)
-        self.EncoderLayer_ge_3 = nn.TransformerEncoderLayer(
-            d_model=omics_model_dim,
-            nhead=omics_nhead,
-            dim_feedforward=omics_ff_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True
-        )
-        self.conv_ge_3 = nn.TransformerEncoder(self.EncoderLayer_ge_3, 1)
 
-        # 单组组学数据特征--MUT
+        # 突变：只使用1层Transformer提取单组学内部特征
         self.mut_value_projection = Linear(1, omics_model_dim)
         self.EncoderLayer_mut_1 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
@@ -303,27 +394,12 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-        self.conv_mut_1 = nn.TransformerEncoder(self.EncoderLayer_mut_1, 1)
-        self.EncoderLayer_mut_2 = nn.TransformerEncoderLayer(
-            d_model=omics_model_dim,
-            nhead=omics_nhead,
-            dim_feedforward=omics_ff_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True
+        self.conv_mut_1 = nn.TransformerEncoder(
+            self.EncoderLayer_mut_1,
+            1
         )
-        self.conv_mut_2 = nn.TransformerEncoder(self.EncoderLayer_mut_2, 1)
-        self.EncoderLayer_mut_3 = nn.TransformerEncoderLayer(
-            d_model=omics_model_dim,
-            nhead=omics_nhead,
-            dim_feedforward=omics_ff_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True
-        )
-        self.conv_mut_3 = nn.TransformerEncoder(self.EncoderLayer_mut_3, 1)
 
-        # 单组组学数据特征--METH
+        # 甲基化：只使用1层Transformer提取单组学内部特征
         self.meth_value_projection = Linear(1, omics_model_dim)
         self.EncoderLayer_meth_1 = nn.TransformerEncoderLayer(
             d_model=omics_model_dim,
@@ -333,123 +409,63 @@ class MTEGDRP(torch.nn.Module):
             activation="gelu",
             batch_first=True
         )
-        self.conv_meth_1 = nn.TransformerEncoder(self.EncoderLayer_meth_1, 1)
-        self.EncoderLayer_meth_2 = nn.TransformerEncoderLayer(
-            d_model=omics_model_dim,
-            nhead=omics_nhead,
-            dim_feedforward=omics_ff_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True
-        )
-        self.conv_meth_2 = nn.TransformerEncoder(self.EncoderLayer_meth_2, 1)
-        self.EncoderLayer_meth_3 = nn.TransformerEncoderLayer(
-            d_model=omics_model_dim,
-            nhead=omics_nhead,
-            dim_feedforward=omics_ff_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True
-        )
-        self.conv_meth_3 = nn.TransformerEncoder(self.EncoderLayer_meth_3, 1)
-
-        # 甲基化和突变分别通过交叉注意力融入mRNA
-        # 三种组学的输入、输出形状均为[batch, 128, 32]
-        self.meth_to_ge_cross_attention = nn.MultiheadAttention(
-            embed_dim=omics_model_dim,
-            num_heads=omics_nhead,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.mut_to_ge_cross_attention = nn.MultiheadAttention(
-            embed_dim=omics_model_dim,
-            num_heads=omics_nhead,
-            dropout=dropout,
-            batch_first=True
-        )
-
-        # 门控：分别控制甲基化和突变信息融入mRNA的比例
-        self.meth_gate = nn.Sequential(
-            Linear(omics_model_dim * 2, omics_model_dim),
-            nn.Sigmoid()
-        )
-        self.mut_gate = nn.Sequential(
-            Linear(omics_model_dim * 2, omics_model_dim),
-            nn.Sigmoid()
-        )
-
-        # 第一次门控融合后，mRNA、甲基化和突变分别再经过一层Transformer
-        self.EncoderLayer_ge_fusion = nn.TransformerEncoderLayer(
-            d_model=omics_model_dim,
-            nhead=omics_nhead,
-            dim_feedforward=omics_ff_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True
-        )
-        self.conv_ge_fusion = nn.TransformerEncoder(
-            self.EncoderLayer_ge_fusion,
+        self.conv_meth_1 = nn.TransformerEncoder(
+            self.EncoderLayer_meth_1,
             1
         )
 
-        self.EncoderLayer_meth_refine = nn.TransformerEncoderLayer(
+        # 四层渐进式双向Co-Attention
+        # 每一层均为独立实例，因此四层之间完全不共享参数
+
+        # 第1层：Mutation <-> Methylation -> Fusion_1
+        self.ca_layer_1 = CoAttentionLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
             dim_feedforward=omics_ff_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True
-        )
-        self.conv_meth_refine = nn.TransformerEncoder(
-            self.EncoderLayer_meth_refine,
-            1
+            dropout=dropout
         )
 
-        self.EncoderLayer_mut_refine = nn.TransformerEncoderLayer(
+        # 第2层：Fusion_1 <-> Methylation -> Fusion_2
+        self.ca_layer_2 = CoAttentionLayer(
             d_model=omics_model_dim,
             nhead=omics_nhead,
             dim_feedforward=omics_ff_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True
-        )
-        self.conv_mut_refine = nn.TransformerEncoder(
-            self.EncoderLayer_mut_refine,
-            1
+            dropout=dropout
         )
 
-        # 第二次交叉注意力使用独立参数
-        self.meth_to_ge_cross_attention_2 = nn.MultiheadAttention(
-            embed_dim=omics_model_dim,
-            num_heads=omics_nhead,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.mut_to_ge_cross_attention_2 = nn.MultiheadAttention(
-            embed_dim=omics_model_dim,
-            num_heads=omics_nhead,
-            dropout=dropout,
-            batch_first=True
+        # 第3层：Fusion_2 <-> mRNA -> Fusion_3
+        self.ca_layer_3 = CoAttentionLayer(
+            d_model=omics_model_dim,
+            nhead=omics_nhead,
+            dim_feedforward=omics_ff_dim,
+            dropout=dropout
         )
 
-        # 第二次门控融合使用独立参数
-        self.meth_gate_2 = nn.Sequential(
-            Linear(omics_model_dim * 2, omics_model_dim),
-            nn.Sigmoid()
-        )
-        self.mut_gate_2 = nn.Sequential(
-            Linear(omics_model_dim * 2, omics_model_dim),
-            nn.Sigmoid()
+        # 第4层：Fusion_3 <-> mRNA -> Fusion_4
+        self.ca_layer_4 = CoAttentionLayer(
+            d_model=omics_model_dim,
+            nhead=omics_nhead,
+            dim_feedforward=omics_ff_dim,
+            dropout=dropout
         )
 
-        # 平均池化后映射回128维，保持与后续药物拼接维度一致
-        self.ge_output_projection = Linear(omics_model_dim, connect_dim)
-        self.mut_output_projection = Linear(omics_model_dim, connect_dim)
+        # Fusion_4平均池化后从32维映射为128维多组学融合特征
+        self.omics_output_projection = Linear(
+            omics_model_dim,
+            connect_dim
+        )
 
-        # 药物特征维度为num_features_xd * 6，融合后的mRNA维度为connect_dim
+        # 保留128维突变特征作为模型第三个返回值
+        # 使用“突变1层Transformer后的表示”平均池化再映射为128维
+        self.mut_output_projection = Linear(
+            omics_model_dim,
+            connect_dim
+        )
+
+        # 药物特征468维 + 多组学融合特征128维 = 596维
         fusion_input_dim = num_features_xd * 6 + connect_dim
 
-        # 保留原来的Transformer Decoder，仅同步修改拼接后的输入维度
+        # 保留原来的Transformer Decoder及其调用方式，不修改后续模块
         self.decoder = TransformerDecoder(
             num_layers=4,
             d_model=fusion_input_dim,
@@ -474,8 +490,8 @@ class MTEGDRP(torch.nn.Module):
         coors = data.coordinates
 
         drug_data = torch.unsqueeze(drug_poi_data, 1)
-        mat_drug_data = self.mat(drug_data)
-        drug_data = self.conv_gcn(mat_drug_data, drug_edg_index)
+        drug_data = self.mat(drug_data)
+        drug_data = self.conv_gcn(drug_data, drug_edg_index)
         drug_data = self.relu(drug_data)
         drug_data = F.relu(self.conv_gin1(drug_data, drug_edg_index))
         drug_data = self.bn1(drug_data)
@@ -485,9 +501,7 @@ class MTEGDRP(torch.nn.Module):
         egnn_list = []
         index = 0
         for data_len in data.c_size:
-            data_len = int(data_len.item())
-            temp_data = mat_drug_data[index:index + data_len]
-            temp_data = self.fc_mat_egnn(temp_data).unsqueeze(0)
+            temp_data = drug_poi_data[index:index + data_len].unsqueeze(0)
             temp_coors = coors[index:index + data_len].unsqueeze(0)
             temp_drug_data_jihe, temp_ehnncoors = self.drug_layer1(temp_data, temp_coors)
             temp_drug_data_jihe, temp_ehnncoors = self.drug_layer2(temp_drug_data_jihe, temp_ehnncoors)
@@ -504,95 +518,81 @@ class MTEGDRP(torch.nn.Module):
         drug_data = self.dropout(drug_data)
         drug_data = self.fc2_drug(drug_data)
 
+        # ==============================================================
+        # 多组学部分：1层Transformer + 4层渐进式双向Co-Attention
+        # ==============================================================
+
         # mRNA：[batch, 128] -> [batch, 128, 1] -> [batch, 128, 32]
-        ge_data = self.ge_value_projection(ge_data.unsqueeze(-1))
+        # 再经过1层Transformer提取mRNA内部特征
+        ge_data = self.ge_value_projection(
+            ge_data.unsqueeze(-1)
+        )
         ge_data = self.conv_ge_1(ge_data)
-        ge_data = self.conv_ge_2(ge_data)
-        ge_data = self.conv_ge_3(ge_data)
 
         # 突变：[batch, 128] -> [batch, 128, 1] -> [batch, 128, 32]
-        mut_data = self.mut_value_projection(mut_data.unsqueeze(-1))
+        # 再经过1层Transformer提取突变内部特征
+        mut_data = self.mut_value_projection(
+            mut_data.unsqueeze(-1)
+        )
         mut_data = self.conv_mut_1(mut_data)
-        mut_data = self.conv_mut_2(mut_data)
-        mut_data = self.conv_mut_3(mut_data)
 
         # 甲基化：[batch, 128] -> [batch, 128, 1] -> [batch, 128, 32]
-        meth_data = self.meth_value_projection(meth_data.unsqueeze(-1))
+        # 再经过1层Transformer提取甲基化内部特征
+        meth_data = self.meth_value_projection(
+            meth_data.unsqueeze(-1)
+        )
         meth_data = self.conv_meth_1(meth_data)
-        meth_data = self.conv_meth_2(meth_data)
-        meth_data = self.conv_meth_3(meth_data)
 
-        # 第一次交叉注意力：甲基化和突变分别以mRNA为Query
-        meth_context_1, _ = self.meth_to_ge_cross_attention(
-            query=ge_data,
-            key=meth_data,
-            value=meth_data,
-            need_weights=False
-        )
-        mut_context_1, _ = self.mut_to_ge_cross_attention(
-            query=ge_data,
-            key=mut_data,
-            value=mut_data,
-            need_weights=False
-        )
-
-        # 第一次门控融合
-        meth_gate_1 = self.meth_gate(
-            torch.cat((ge_data, meth_context_1), dim=-1)
-        )
-        mut_gate_1 = self.mut_gate(
-            torch.cat((ge_data, mut_context_1), dim=-1)
-        )
-        ge_data = (
-                ge_data
-                + meth_gate_1 * meth_context_1
-                + mut_gate_1 * mut_context_1
-        )
-
-        # 第一次融合后，三种组学分别再经过一层Transformer
-        ge_data = self.conv_ge_fusion(ge_data)
-        meth_data = self.conv_meth_refine(meth_data)
-        mut_data = self.conv_mut_refine(mut_data)
-
-        # 保留128维突变特征作为模型第三个返回值
+        # 保留突变1层Transformer后的128维输出，维持原来的第三返回值接口
         mut_output = self.mut_output_projection(
             mut_data.mean(dim=1)
         )
 
-        # 第二次交叉注意力：使用独立参数
-        meth_context_2, _ = self.meth_to_ge_cross_attention_2(
-            query=ge_data,
-            key=meth_data,
-            value=meth_data,
-            need_weights=False
-        )
-        mut_context_2, _ = self.mut_to_ge_cross_attention_2(
-            query=ge_data,
-            key=mut_data,
-            value=mut_data,
-            need_weights=False
+        # 第1层双向CA：Mutation <-> Methylation
+        # mut_data和meth_data均为[batch, 128, 32]
+        # 输出Fusion_1：[batch, 128, 32]
+        fusion_1 = self.ca_layer_1(
+            mut_data,
+            meth_data
         )
 
-        # 第二次门控融合：使用独立参数
-        meth_gate_2 = self.meth_gate_2(
-            torch.cat((ge_data, meth_context_2), dim=-1)
-        )
-        mut_gate_2 = self.mut_gate_2(
-            torch.cat((ge_data, mut_context_2), dim=-1)
-        )
-        ge_data = (
-                ge_data
-                + meth_gate_2 * meth_context_2
-                + mut_gate_2 * mut_context_2
+        # 第2层双向CA：Fusion_1 <-> Methylation
+        # 输出Fusion_2：[batch, 128, 32]
+        fusion_2 = self.ca_layer_2(
+            fusion_1,
+            meth_data
         )
 
-        # 对128个token做平均池化，再映射为[batch, 128]
-        ge_data = self.ge_output_projection(
-            ge_data.mean(dim=1)
+        # 第3层双向CA：Fusion_2 <-> mRNA
+        # 输出Fusion_3：[batch, 128, 32]
+        fusion_3 = self.ca_layer_3(
+            fusion_2,
+            ge_data
         )
 
-        # 只将药物特征和融合后的mRNA特征拼接
-        concat_data = torch.cat((drug_data, ge_data), 1)
+        # 第4层双向CA：Fusion_3 <-> mRNA
+        # 输出Fusion_4：[batch, 128, 32]
+        fusion_4 = self.ca_layer_4(
+            fusion_3,
+            ge_data
+        )
+
+        # Fusion_4对128个token做平均池化：[batch, 128, 32] -> [batch, 32]
+        # 再映射为最终多组学融合特征：[batch, 128]
+        omics_data = self.omics_output_projection(
+            fusion_4.mean(dim=1)
+        )
+
+        # 药物特征[batch, 468] + 多组学融合特征[batch, 128]
+        # 最终拼接为[batch, 596]
+        concat_data = torch.cat(
+            (drug_data, omics_data),
+            dim=1
+        )
+
+        # ==============================================================
+        # 以下Decoder和后续FC保持原来的代码不变
+        # ==============================================================
 
         # 保留原来的Transformer Decoder及其调用方式
         concat_data = concat_data.unsqueeze(0)
@@ -615,4 +615,4 @@ class MTEGDRP(torch.nn.Module):
         out = self.out(concat_data)
         # out = self.sigmoid(out)
         # out = nn.Sigmoid()(out)
-        return out, drug_data, mut_output
+        return out, drug_data, mut_output # Remove batch dimension after processing
